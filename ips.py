@@ -1,56 +1,46 @@
 import redis
-import json
+import time
 import sys
-import subprocess
+from util import restart_service
 
-def restart_service(service_name):
-    try:
-        # Uses systemctl to restart the service
-        result = subprocess.run(['service', service_name, 'restart'], check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print(f"Service {service_name} restarted successfully.")
-        return result.stdout
-    except subprocess.CalledProcessError as e:
-        # Handles cases where the restart command fails
-        print(f"Failed to restart service {service_name}. Error: {e.stderr}")
-    except Exception as e:
-        # Generic exception handling for other unexpected errors
-        print(f"An unexpected error occurred: {e}")
-
-def block_ip(ip_address):
-    # Ensure the directory exists and handle cases where it might not
-    try:
-        with open("/etc/banip/banip.blocklist", "a") as file:
-            file.write(ip_address + "\n")
-        restart_service('banip')
-    except Exception as e:
-        print(f"Failed to append IP to blocklist: {e}", file=sys.stderr)
-
-
+def block_ips(ip_addresses):
+    unique_ips = list(set(ip_addresses))  # Convert list to set to remove duplicates, then back to list
+    if unique_ips:  # Only proceed if there are unique IPs to block
+        try:
+            with open("/etc/banip/banip.blocklist", "a") as file:
+                for ip_address in unique_ips:
+                    file.write(ip_address + "\n")
+            restart_service('banip')
+            print(f"Blocked {len(unique_ips)} unique IPs and restarted the service.")
+        except Exception as e:
+            print(f"Failed to append IPs to blocklist: {e}", file=sys.stderr)
+            
 # Connect to Redis
 redis_host = "192.168.1.50"
 redis_port = 6379
 r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
 
-# Key name where Suricata logs are pushed
-list_key = 'suricata'
+list_key = 'router-block'
+batch_time = 5  # Batch processing time in seconds
 
-# Continuously read and print logs
 try:
+    ip_batch = []
+    last_time = time.time()
+    
     while True:
-        # Retrieve log from Redis list (blocking operation)
-        log = r.blpop(list_key, timeout=0)
-        event = json.loads(log[1])
-        if event['event_type'] != 'alert' or event['alert']['severity'] > 2:
-            continue;
- 
-        print(json.dumps(event, indent=4))
-        
-        if event['alert']['severity'] == 1:    
-            print("Blocking IP {}".format(event['src_ip']))
-            block_ip(event['src_ip'])
+        if (time.time() - last_time) >= batch_time and len(ip_batch):
+            block_ips(ip_batch)
+            ip_batch = []  # Clear the current batch
+            last_time = time.time()  # Reset timer after processing
+
+        log = r.blpop(list_key, timeout=1)  # Short timeout for blpop
+        if log:
+            ip_batch.append(log[1])
+            print("Queued IP for blocking: {}".format(log[1]))
+
 except KeyboardInterrupt:
     print("Stopped by the user.")
-
+    if ip_batch:  # Ensure to block remaining IPs before exiting
+        block_ips(ip_batch)
 except Exception as e:
     print(f"An error occurred: {e}")
-
